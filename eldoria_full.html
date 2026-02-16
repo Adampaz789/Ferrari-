@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Chronicles of Eldoria — Full Prototype</title>
+<style>
+  html,body { height:100%; margin:0; background:#000; display:flex; align-items:center; justify-content:center; }
+  canvas { image-rendering: pixelated; width:768px; height:720px; background:#000; display:block; }
+  /* Minimal font fallback for dialog */
+  @font-face { font-family: "monos"; src: local("monospace"); }
+</style>
+</head>
+<body>
+<canvas id="game" width="256" height="240"></canvas>
+
+<script>
+/* ======================================
+   Chronicles of Eldoria — Single File
+   - Tiles, collisions, dialogs
+   - Sword + Magic + Projectiles
+   - Boss with phased AI
+   - Inventory & save (localStorage)
+   - Simple 8-bit sound effects (WebAudio)
+   ====================================== */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+const TILE = 16;
+const COLS = canvas.width / TILE; // 16
+const ROWS = canvas.height / TILE; // 15 (but top UI row reserved)
+const UI_HEIGHT = 20; // top UI in pixels
+
+// KEY HANDLING (use e.code for reliability)
+const keys = {};
+window.addEventListener("keydown", e => {
+  keys[e.code] = true;
+  // start audio on first gesture (user gesture required)
+  if (!audioInited) initAudio();
+});
+window.addEventListener("keyup", e => keys[e.code] = false);
+
+// ---------- AUDIO (simple chiptune-like effects) ----------
+let audioCtx = null;
+let audioInited = false;
+function initAudio(){
+  try{
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioInited = true;
+  }catch(e){
+    console.warn("Audio no soportado.");
+    audioInited = false;
+  }
+}
+function playTone(freq=440, time=0.08, type="square", gain=0.12){
+  if(!audioInited) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.value = gain;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + time);
+}
+
+// short melodies (called sparingly)
+function playVictory(){
+  if(!audioInited) return;
+  const now = audioCtx.currentTime;
+  const o1 = audioCtx.createOscillator();
+  const g1 = audioCtx.createGain();
+  o1.type = "square"; o1.frequency.value = 880;
+  g1.gain.value = 0.08;
+  o1.connect(g1); g1.connect(audioCtx.destination);
+  o1.start(now); o1.stop(now + 0.12);
+  setTimeout(()=>playTone(660,0.12),120);
+  setTimeout(()=>playTone(550,0.18),250);
+}
+
+// ---------- UTILS ----------
+function rectColl(a,b){
+  return a.x < b.x + b.w &&
+         a.x + a.w > b.x &&
+         a.y < b.y + b.h &&
+         a.y + a.h > b.y;
+}
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+// ---------- ENTITY BASE ----------
+class Entity {
+  constructor(x,y,w,h,color){
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.color = color || "#fff";
+    this.alive = true;
+  }
+  draw(){
+    ctx.fillStyle = this.color;
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+  }
+}
+
+// ---------- PLAYER ----------
+class Player extends Entity {
+  constructor(x,y){
+    super(x,y,16,16,"#2ecc71");
+    this.speed = 1.6;
+    this.hp = 6;
+    this.maxHp = 6;
+    this.magic = 3;
+    this.inv = 0; // invulnerability frames
+    this.facing = "down";
+    this.attacking = false;
+    this.inventory = { keys: 0 };
+  }
+
+  tryMove(dx,dy){
+    // attempt move with tile collision resolution
+    const stepX = dx;
+    const stepY = dy;
+    this.x += stepX;
+    if (this.collideSolid()) {
+      this.x -= stepX;
+    }
+    this.y += stepY;
+    if (this.collideSolid()) {
+      this.y -= stepY;
+    }
+    // clamp to screen play area (leave UI lane at top)
+    this.x = clamp(this.x, 0, canvas.width - this.w);
+    this.y = clamp(this.y, UI_HEIGHT, canvas.height - this.h);
+  }
+
+  collideSolid(){
+    // check collision against solid tiles (tile values >=10 considered solid)
+    const tilesToCheck = this.getOverlappingTiles();
+    for(const t of tilesToCheck){
+      if (isSolidTile(currentMap.tiles[t.row][t.col])) return true;
+    }
+    return false;
+  }
+
+  getOverlappingTiles(){
+    // returns list of {row, col} tiles overlapped by player
+    const left = Math.floor(this.x / TILE);
+    const right = Math.floor((this.x + this.w - 1) / TILE);
+    const top = Math.floor((this.y - UI_HEIGHT) / TILE);
+    const bottom = Math.floor((this.y + this.h - 1 - UI_HEIGHT) / TILE);
+    const list = [];
+    for(let r = top; r <= bottom; r++){
+      for(let c = left; c <= right; c++){
+        if (r >= 0 && r < currentMap.rows && c >= 0 && c < currentMap.cols){
+          list.push({row: r, col: c});
+        }
+      }
+    }
+    return list;
+  }
+
+  update(){
+    if (this.inv > 0) this.inv--;
+    if (dialogActive || gameState !== "play") return;
+
+    // Movement input (arrows or WASD)
+    let dx = 0, dy = 0;
+    if (keys["ArrowUp"] || keys["KeyW"]) { dy -= this.speed; this.facing = "up"; }
+    if (keys["ArrowDown"] || keys["KeyS"]) { dy += this.speed; this.facing = "down"; }
+    if (keys["ArrowLeft"] || keys["KeyA"]) { dx -= this.speed; this.facing = "left"; }
+    if (keys["ArrowRight"] || keys["KeyD"]) { dx += this.speed; this.facing = "right"; }
+
+    // normalize diagonal speed
+    if (dx !== 0 && dy !== 0) { dx *= Math.SQRT1_2; dy *= Math.SQRT1_2; }
+
+    this.tryMove(dx, dy);
+
+    // Attack (Space) - melee
+    if ((keys["Space"] || keys["Spacebar"]) && !this.attacking){
+      this.attacking = true;
+      attackSound();
+      setTimeout(()=> this.attacking = false, 160);
+      keys["Space"] = false; // prevent auto-repeat
+    }
+
+    // Magic (KeyM)
+    if (keys["KeyM"] && this.magic > 0){
+      spawnMagic(this.x + this.w/2 - 3, this.y + this.h/2 - 3, this.facing);
+      this.magic--;
+      keys["KeyM"] = false;
+    }
+
+    // Interact (Enter)
+    if (keys["Enter"]){
+      // check NPCs
+      for(const n of npcs){
+        if (rectColl(this, n)) {
+          dialogStart(n.dialog);
+          keys["Enter"] = false;
+          break;
+        }
+      }
+      // check door tile (if player standing on door and has key)
+      const pt = this.getOverlappingTiles()[0];
+      if (pt) {
+        const tileVal = currentMap.tiles[pt.row][pt.col];
+        if (tileVal === TILE_DOOR && !dialogActive) {
+          if (enemies.length === 0) {
+            if (currentMap.requiresKey) {
+              if (this.inventory.keys > 0) {
+                this.inventory.keys--;
+                advanceLevel();
+              } else {
+                dialogStart("La puerta requiere una llave.");
+              }
+            } else {
+              advanceLevel();
+            }
+          } else {
+            dialogStart("Aún quedan enemigos...");
+          }
+          keys["Enter"] = false;
+        }
+      }
+    }
+
+    // Pickup keys/items if on tile
+    this.tryPickupTile();
+  }
+
+  tryPickupTile(){
+    const tiles = this.getOverlappingTiles();
+    for(const t of tiles){
+      const val = currentMap.tiles[t.row][t.col];
+      if (val === TILE_KEY) {
+        currentMap.tiles[t.row][t.col] = TILE_FLOOR;
+        this.inventory.keys++;
+        playTone(880,0.08);
+        dialogStart("Has recogido una llave.");
+      }
+      if (val === TILE_MAGIC_UP) {
+        currentMap.tiles[t.row][t.col] = TILE_FLOOR;
+        this.magic = Math.min(this.maxHp, this.magic + 2);
+        playTone(660,0.12);
+        dialogStart("Magia aumentada.");
+      }
+    }
+  }
+
+  takeDamage(){
+    if (this.inv === 0) {
+      this.hp--;
+      this.inv = 60;
+      hitSound();
+      if (this.hp <= 0) {
+        this.hp = 0;
+      }
+    }
+  }
+
+  draw(){
+    // blinking when invincible
+    if (this.inv > 0) {
+      if ((Math.floor(this.inv/4) % 2) === 0) super.draw();
+    } else {
+      super.draw();
+    }
+    // attack sprite (small white square in facing dir)
+    if (this.attacking) {
+      ctx.fillStyle = "#ffffff";
+      let sx = this.x, sy = this.y;
+      if (this.facing === "up") sy -= 8;
+      if (this.facing === "down") sy += this.h;
+      if (this.facing === "left") sx -= 8;
+      if (this.facing === "right") sx += this.w;
+      ctx.fillRect(Math.round(sx), Math.round(sy), 8, 8);
+    }
+  }
+}
+
+// ---------- ENEMIES ----------
+class Enemy extends Entity {
+  constructor(x,y,hp=2,speed=0.5,color="#e74c3c"){
+    super(x,y,16,16,color);
+    this.hp = hp;
+    this.speed = speed;
+    this.dir = Math.random() < 0.5 ? -1 : 1;
+    this.stateTimer = 0;
+  }
+  update(){
+    // simple patrol left-right; if close to player, approach
+    const dist = Math.hypot((player.x - this.x), (player.y - this.y));
+    if (dist < 50) {
+      // move toward player
+      const ax = player.x > this.x ? this.speed : -this.speed;
+      const ay = player.y > this.y ? this.speed : -this.speed;
+      this.x += ax * 0.6;
+      this.y += ay * 0.6;
+    } else {
+      this.x += this.speed * this.dir;
+      if (this.x < 12 || this.x > canvas.width - 28) this.dir *= -1;
+    }
+
+    // clamp to map and tile collision
+    // simple: don't go inside solid tiles
+    this.resolveMapCollision();
+
+    if (rectColl(this, player)) {
+      player.takeDamage();
+    }
+  }
+  resolveMapCollision(){
+    // if overlapping a solid tile, nudge back
+    const left = Math.floor(this.x / TILE);
+    const right = Math.floor((this.x + this.w - 1) / TILE);
+    const top = Math.floor((this.y - UI_HEIGHT) / TILE);
+    const bottom = Math.floor((this.y + this.h - 1 - UI_HEIGHT) / TILE);
+    for(let r=top; r<=bottom; r++){
+      for(let c=left; c<=right; c++){
+        if (r>=0 && r<currentMap.rows && c>=0 && c<currentMap.cols){
+          if (isSolidTile(currentMap.tiles[r][c])){
+            // simple bounce
+            this.x -= this.speed * this.dir * 2;
+            this.dir *= -1;
+          }
+        }
+      }
+    }
+    this.x = clamp(this.x, 0, canvas.width - this.w);
+    this.y = clamp(this.y, UI_HEIGHT, canvas.height - this.h);
+  }
+  hit(){
+    this.hp--;
+    hitSound();
+    if (this.hp <= 0) {
+      this.alive = false;
+      playTone(440, 0.12);
+    }
+  }
+}
+
+// Boss with phased AI
+class Boss extends Enemy {
+  constructor(x,y){
+    super(x,y,12,1,"#8e44ad");
+    this.phase = 1;
+    this.shootTimer = 0;
+  }
+  update(){
+    // Phase changes by remaining HP
+    if (this.hp <= 8 && this.phase === 1) { this.phase = 2; this.speed = 1.2; }
+    if (this.hp <= 4 && this.phase === 2) { this.phase = 3; this.speed = 1.6; }
+
+    // movement: pursue player more aggressively in later phases
+    const dx = player.x - this.x;
+    const dy = player.y - this.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist > 32) {
+      this.x += (dx / dist) * this.speed * (this.phase * 0.6);
+      this.y += (dy / dist) * this.speed * (this.phase * 0.6);
+    } else {
+      // close-range knockback
+      if (Math.random() < 0.02) {
+        player.takeDamage();
+        // small knockback
+        player.x += (dx>0 ? 8 : -8);
+        player.y += (dy>0 ? 8 : -8);
+      }
+    }
+
+    // shooting projectiles in phases 2 and 3
+    this.shootTimer--;
+    if (this.phase >= 2 && this.shootTimer <= 0) {
+      this.shootTimer = 60 - this.phase*10; // faster in later phases
+      this.shootAtPlayer();
+    }
+
+    if (rectColl(this, player)) {
+      player.takeDamage();
+    }
+
+    this.x = clamp(this.x, 0, canvas.width - this.w);
+    this.y = clamp(this.y, UI_HEIGHT, canvas.height - this.h);
+  }
+  shootAtPlayer(){
+    const sx = this.x + this.w/2 - 3;
+    const sy = this.y + this.h/2 - 3;
+    // create projectile directed toward player's current position
+    const angle = Math.atan2(player.y - this.y, player.x - this.x);
+    enemiesProjectiles.push(new EnemyProjectile(sx, sy, Math.cos(angle), Math.sin(angle)));
+    playTone(220, 0.06);
+  }
+}
+
+// ---------- PROJECTILES ----------
+class Magic extends Entity {
+  constructor(x,y,dir){
+    super(x,y,6,6,"#00ffff");
+    this.dir = dir;
+    this.speed = 3.2;
+  }
+  update(){
+    if (this.dir === "up") this.y -= this.speed;
+    if (this.dir === "down") this.y += this.speed;
+    if (this.dir === "left") this.x -= this.speed;
+    if (this.dir === "right") this.x += this.speed;
+    // collision with enemies
+    for(const e of enemies){
+      if (e.alive && rectColl(this,e)){
+        e.hit();
+        this.alive = false;
+        return;
+      }
+    }
+    // out of bounds
+    if (this.x < -10 || this.x > canvas.width + 10 || this.y < -10 || this.y > canvas.height + 10) this.alive = false;
+  }
+}
+
+class EnemyProjectile extends Entity {
+  constructor(x,y,vx,vy){
+    super(x,y,6,6,"#ff8800");
+    this.vx = vx * 2.4;
+    this.vy = vy * 2.4;
+  }
+  update(){
+    this.x += this.vx;
+    this.y += this.vy;
+    if (rectColl(this, player)) {
+      player.takeDamage();
+      this.alive = false;
+    }
+    if (this.x < -10 || this.x > canvas.width + 10 || this.y < -10 || this.y > canvas.height + 10) this.alive = false;
+  }
+}
+
+// ---------- NPC ----------
+class NPC extends Entity {
+  constructor(x,y,text){
+    super(x,y,16,16,"#ffb6c1");
+    this.dialog = text;
+  }
+}
+
+// ---------- TILE MAP ----------
+/* Tile legend:
+   0 = floor
+   1 = wall (solid)
+   2 = door (advance)
+   3 = key (pickup)
+   4 = magic-up (pickup)
+*/
+const TILE_FLOOR = 0;
+const TILE_WALL  = 1;
+const TILE_DOOR  = 2;
+const TILE_KEY   = 3;
+const TILE_MAGIC_UP = 4;
+
+function isSolidTile(val){
+  return val === TILE_WALL;
+}
+
+// create simple maps programmatically for three levels
+function createMap1(){
+  // border walls + simple obstacles
+  const rows = 14, cols = 16;
+  const tiles = Array.from({length: rows}, (_,r) =>
+    Array.from({length: cols}, (_,c) => {
+      if (r === 0 || r === rows-1 || c === 0 || c === cols-1) return TILE_WALL;
+      return TILE_FLOOR;
+    })
+  );
+  // add interior walls
+  for(let c=3;c<13;c+=3) tiles[4][c] = TILE_WALL;
+  // place door at top center (row 0 is wall, door is at row 0? We'll place at row 0 to match earlier behaviour)
+  tiles[0][8] = TILE_DOOR;
+  // place a key
+  tiles[8][3] = TILE_KEY;
+  return {rows, cols, tiles, requiresKey: true};
+}
+function createMap2(){
+  const rows = 14, cols = 16;
+  const tiles = Array.from({length: rows}, (_,r) =>
+    Array.from({length: cols}, (_,c) => {
+      if (r === 0 || r === rows-1 || c === 0 || c === cols-1) return TILE_WALL;
+      return TILE_FLOOR;
+    })
+  );
+  // add trees (walls)
+  for(let r=3;r<10;r++) tiles[r][6] = TILE_WALL;
+  for(let r=5;r<12;r++) tiles[r][10] = TILE_WALL;
+  // door at top center
+  tiles[0][8] = TILE_DOOR;
+  // magic upgrade
+  tiles[10][12] = TILE_MAGIC_UP;
+  return {rows, cols, tiles, requiresKey: false};
+}
+function createMap3(){
+  const rows = 14, cols = 16;
+  const tiles = Array.from({length: rows}, (_,r) =>
+    Array.from({length: cols}, (_,c) => {
+      if (r === 0 || r === rows-1 || c === 0 || c === cols-1) return TILE_WALL;
+      return TILE_FLOOR;
+    })
+  );
+  // castle interior obstacles
+  for(let c=3;c<13;c++) tiles[6][c] = TILE_WALL;
+  // boss arena open center - no door required
+  return {rows, cols, tiles, requiresKey: false};
+}
+
+const maps = [createMap1(), createMap2(), createMap3()];
+let currentMap = maps[0];
+
+// ---------- GAME STATE ----------
+let player = new Player(120, 180);
+let enemies = [];
+let enemiesProjectiles = [];
+let projectiles = []; // player's magic
+let npcs = [];
+let dialogActive = false;
+let dialogLines = [];
+let dialogIndex = 0;
+let gameState = "play"; // "play", "victory", "gameover"
+let level = 1;
+
+// ---------- SOUNDS ----------
+function attackSound(){ playTone(1200, 0.06); }
+function hitSound(){ playTone(220, 0.09); }
+function pickupSound(){ playTone(880, 0.06); }
+
+// ---------- LEVEL / SPAWN LOGIC ----------
+function spawnLevel(n){
+  currentMap = maps[n-1];
+  npcs = [];
+  enemies = [];
+  enemiesProjectiles = [];
+  projectiles = [];
+  dialogActive = false;
+  dialogLines = []; dialogIndex = 0;
+
+  // spawn enemies and NPCs according to level
+  if (n === 1){
+    enemies.push(new Enemy(60, 100));
+    enemies.push(new Enemy(180, 120));
+    npcs.push(new NPC(120, 60, "Arin... Morvath ha despertado.\nRecoge la llave y entra al castillo."));
+    // ensure player within area
+    player.x = 120; player.y = 180;
+  } else if (n === 2){
+    enemies.push(new Enemy(50, 100));
+    enemies.push(new Enemy(150, 100));
+    enemies.push(new Enemy(200, 80));
+    npcs.push(new NPC(30, 200, "Prepárate. El castillo está al norte."));
+    player.x = 120; player.y = 180;
+  } else if (n === 3){
+    enemies.push(new Boss(100, 60));
+    player.x = 120; player.y = 180;
+  }
+  // if we have a saved inventory, keep it
+}
+
+// Advance to next level (called when door used or enemies cleared)
+function advanceLevel(){
+  level++;
+  if (level > maps.length) {
+    victory();
+    return;
+  }
+  spawnLevel(level);
+  saveGame();
+}
+
+// ---------- DIALOG ----------
+function dialogStart(text){
+  dialogActive = true;
+  dialogLines = text.split("\n");
+  dialogIndex = 0;
+}
+function dialogNext(){
+  dialogIndex++;
+  if (dialogIndex >= dialogLines.length) {
+    dialogActive = false;
+    dialogLines = [];
+    dialogIndex = 0;
+  }
+}
+
+// ---------- PICK SPAWN HELPERS ----------
+function spawnMagic(x,y,dir){
+  projectiles.push(new Magic(x,y,dir));
+  playTone(1000,0.06);
+}
+
+function spawnEnemyProjectile(x,y,vx,vy){
+  enemiesProjectiles.push(new EnemyProjectile(x,y,vx,vy));
+}
+
+// ---------- SAVE / LOAD ----------
+const SAVE_KEY = "eldoria_save_v1";
+function saveGame(){
+  const data = {
+    level,
+    player: {
+      x: player.x, y: player.y, hp: player.hp, magic: player.magic, inventory: player.inventory
+    },
+    mapTiles: currentMap.tiles // store current map tiles so pickups persist
+  };
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+    // small sound indicating save
+    playTone(1000, 0.04);
+  } catch (e) {
+    console.warn("No se pudo guardar:", e);
+  }
+}
+function loadGame(){
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return false;
+    const data = JSON.parse(raw);
+    if (!data) return false;
+    // restore
+    level = data.level || 1;
+    // replace current map tiles with saved ones
+    maps[level-1].tiles = data.mapTiles || maps[level-1].tiles;
+    currentMap = maps[level-1];
+    player.x = data.player.x || 120;
+    player.y = data.player.y || 180;
+    player.hp = data.player.hp || player.maxHp;
+    player.magic = data.player.magic || 3;
+    player.inventory = data.player.inventory || {keys:0};
+    spawnLevel(level);
+    return true;
+  } catch (e) {
+    console.warn("Carga fallida", e);
+    return false;
+  }
+}
+
+// ---------- DRAW MAP ----------
+function drawMap(){
+  // draw top UI bar background
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, UI_HEIGHT);
+
+  // draw tiles offset by UI_HEIGHT
+  for(let r=0;r<currentMap.rows;r++){
+    for(let c=0;c<currentMap.cols;c++){
+      const val = currentMap.tiles[r][c];
+      const x = c * TILE;
+      const y = UI_HEIGHT + r * TILE;
+      if (val === TILE_WALL) {
+        ctx.fillStyle = "#2b2b2b"; // wall color
+        ctx.fillRect(x,y,TILE,TILE);
+      } else if (val === TILE_FLOOR) {
+        ctx.fillStyle = "#3cb043"; // grass/floor
+        ctx.fillRect(x,y,TILE,TILE);
+      } else if (val === TILE_DOOR) {
+        ctx.fillStyle = enemies.length === 0 ? "#a0522d" : "#7a4f3c"; // open/closed
+        ctx.fillRect(x,y,TILE,TILE);
+      } else if (val === TILE_KEY) {
+        ctx.fillStyle = "#f1c40f";
+        ctx.fillRect(x+4,y+4,8,8);
+      } else if (val === TILE_MAGIC_UP) {
+        ctx.fillStyle = "#00ffff";
+        ctx.fillRect(x+4,y+4,8,8);
+      } else {
+        // default floor
+        ctx.fillStyle = "#3cb043";
+        ctx.fillRect(x,y,TILE,TILE);
+      }
+    }
+  }
+}
+
+// ---------- UI DRAW ----------
+function drawUI(){
+  // top bar
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0,0,256,UI_HEIGHT);
+
+  // hearts
+  for(let i=0;i<player.maxHp;i++){
+    ctx.strokeStyle = "#222";
+    ctx.strokeRect(4 + i*10, 4, 8, 8);
+    if (i < player.hp) {
+      ctx.fillStyle = "#ff0000";
+      ctx.fillRect(4 + i*10, 4, 8, 8);
+    }
+  }
+  // magic
+  for(let i=0;i<player.magic;i++){
+    ctx.fillStyle = "#00ffff";
+    ctx.fillRect(140 + i*10, 4, 8, 8);
+  }
+  // inventory keys display
+  ctx.fillStyle = "#f1c40f";
+  ctx.fillRect(220, 4, 8, 8);
+  ctx.fillStyle = "#fff";
+  ctx.font = "9px monospace";
+  ctx.fillText("x" + (player.inventory.keys || 0), 230, 12);
+
+  // level
+  ctx.fillStyle = "#fff";
+  ctx.fillText("Nivel " + level, 6, 12);
+}
+
+// ---------- GAME CONTROL ----------
+function victory(){
+  gameState = "victory";
+  playVictory();
+}
+function gameOver(){
+  gameState = "gameover";
+}
+
+// ---------- SOUNDS ON EVENTS ----------
+function hitSound(){ playTone(220, 0.08); }
+function pickupSound(){ playTone(880, 0.06); }
+
+// ---------- MAIN LOOP ----------
+function updateAll(){
+  if (gameState === "gameover" || gameState === "victory") return;
+  player.update();
+
+  // Player melee attack hits
+  if (player.attacking) {
+    // create a small hitbox
+    const hx = {
+      x: player.x + (player.facing==="right"? player.w : (player.facing==="left"? -8 : 0)),
+      y: player.y + (player.facing==="down" ? player.h : (player.facing==="up"? -8 : 0)),
+      w: (player.facing==="left"||player.facing==="right") ? 8 : player.w,
+      h: (player.facing==="up"||player.facing==="down") ? 8 : player.h
+    };
+    for(const e of enemies){
+      if (e.alive && rectColl(hx, e)) e.hit();
+    }
+  }
+
+  // Enemies update
+  for(const e of enemies) if (e.alive) e.update();
+
+  // Projectiles (player)
+  for(const p of projectiles) if (p.alive) p.update();
+
+  // Enemy projectiles
+  for(const p of enemiesProjectiles) if (p.alive) p.update();
+
+  // collisions: enemies can be damaged by player's magic already handled in Magic.update
+  // remove dead entities
+  enemies = enemies.filter(e => e.alive);
+  projectiles = projectiles.filter(p => p.alive);
+  enemiesProjectiles = enemiesProjectiles.filter(p => p.alive);
+
+  // if no enemies left and map has door then door may open (advance by interacting)
+  // auto advance if door at top and player touches it
+  if (enemies.length === 0) {
+    // optional: if door is at row 0 and player y <= UI_HEIGHT, advance
+    // but we require interact to advance so user can read dialog or pick items
+  }
+
+  // check game over
+  if (player.hp <= 0) {
+    gameOver();
+  }
+}
+
+function drawAll(){
+  // background + map
+  drawMap();
+
+  // draw NPCs
+  for(const n of npcs) n.draw();
+
+  // draw enemies
+  for(const e of enemies) e.draw();
+
+  // draw enemy projectiles
+  for(const p of enemiesProjectiles) p.draw();
+
+  // draw projectiles
+  for(const p of projectiles) p.draw();
+
+  // draw player last
+  player.draw();
+
+  // UI
+  drawUI();
+
+  // dialog box
+  if (dialogActive) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(12, 150, 232, 72);
+    ctx.fillStyle = "#fff";
+    ctx.font = "10px monospace";
+    for(let i=0;i<dialogLines.length;i++){
+      ctx.fillText(dialogLines[i], 20, 168 + i*14);
+    }
+    ctx.fillText("ENTER para continuar", 20, 232);
+  }
+
+  // game over / victory overlays
+  if (gameState === "gameover") {
+    ctx.fillStyle = "rgba(0,0,0,0.7)";
+    ctx.fillRect(0,0,256,240);
+    ctx.fillStyle = "#fff";
+    ctx.font = "14px monospace";
+    ctx.fillText("GAME OVER", 80, 100);
+    ctx.font = "10px monospace";
+    ctx.fillText("R para reiniciar", 78, 130);
+  } else if (gameState === "victory") {
+    ctx.fillStyle = "rgba(0,0,0,0.85)";
+    ctx.fillRect(0,0,256,240);
+    ctx.fillStyle = "#fff";
+    ctx.font = "12px monospace";
+    ctx.fillText("HAS VENCIDO A MORVATH", 28, 110);
+    ctx.fillText("ELDORIA ES LIBRE", 60, 135);
+  }
+}
+
+function loop(){
+  updateAll();
+  drawAll();
+  requestAnimationFrame(loop);
+}
+
+// ---------- INPUT: dialog progression, save/load, restart ----------
+window.addEventListener("keydown", (e) => {
+  if (dialogActive && e.code === "Enter") {
+    dialogNext();
+    return;
+  }
+  if (gameState === "gameover" && e.code === "KeyR") {
+    // restart fresh
+    player = new Player(120,180);
+    level = 1;
+    maps[0] = createMap1();
+    maps[1] = createMap2();
+    maps[2] = createMap3();
+    spawnLevel(1);
+    gameState = "play";
+    return;
+  }
+  if (e.code === "KeyS") {
+    saveGame();
+  }
+});
+
+// ---------- INIT: attempt to load save or start fresh ----------
+if (!loadGame()){
+  level = 1;
+  player = new Player(120, 180);
+  spawnLevel(level);
+} else {
+  // if loadGame succeeded, ensure enemies spawned for that level
+  spawnLevel(level);
+}
+
+// ensure map has tiles for pickups persistent between sessions
+currentMap = maps[level-1];
+
+// ---------- SPAWN ONCE function to fill npcs/enemies for new spawnLevel call ----------
+function spawnLevel(n){
+  currentMap = maps[n-1];
+  npcs = [];
+  enemies = [];
+  enemiesProjectiles = [];
+  projectiles = [];
+  dialogActive = false;
+  dialogLines = [];
+
+  // replicate logic from earlier spawnLevel
+  if (n === 1) {
+    enemies.push(new Enemy(60, 100));
+    enemies.push(new Enemy(180, 120));
+    npcs.push(new NPC(120, 60, "Arin... Morvath ha despertado.\nRecoge la llave y abre la puerta."));
+  } else if (n === 2) {
+    enemies.push(new Enemy(50, 100));
+    enemies.push(new Enemy(150, 100));
+    enemies.push(new Enemy(200, 80));
+    npcs.push(new NPC(30, 200, "El castillo está al norte."));
+  } else if (n === 3) {
+    enemies.push(new Boss(100, 60));
+  }
+  // keep player position but clamp if out of bounds
+  player.x = clamp(player.x, 0, canvas.width - player.w);
+  player.y = clamp(player.y, UI_HEIGHT, canvas.height - player.h);
+}
+
+// ---------- TILES utility: if player steps on the door tile and enemies are dead, advance ----------
+function tryAutoAdvanceIfOnDoor(){
+  const tiles = player.getOverlappingTiles();
+  for(const t of tiles){
+    const tv = currentMap.tiles[t.row][t.col];
+    if (tv === TILE_DOOR && enemies.length === 0) {
+      // if requires key, check inventory
+      if (currentMap.requiresKey && player.inventory.keys === 0) {
+        dialogStart("Necesitas una llave para pasar.");
+      } else {
+        advanceLevel();
+      }
+    } else if (tv === TILE_KEY) {
+      currentMap.tiles[t.row][t.col] = TILE_FLOOR;
+      player.inventory.keys++;
+      pickupSound();
+      dialogStart("Has recogido una llave.");
+      saveGame();
+    } else if (tv === TILE_MAGIC_UP) {
+      currentMap.tiles[t.row][t.col] = TILE_FLOOR;
+      player.magic = Math.min(player.maxHp, player.magic + 2);
+      pickupSound();
+      dialogStart("Magia incrementada.");
+      saveGame();
+    }
+  }
+}
+
+// call tile interactions periodically (in updateAll)
+const originalUpdateAll = updateAll;
+updateAll = function(){
+  originalUpdateAll();
+  if (!dialogActive && gameState === "play") tryAutoAdvanceIfOnDoor();
+  // if all enemies dead and level < 3, mark door as open automatically (visual only)
+  if (enemies.length === 0 && level < 3) {
+    // nothing to do here; player can interact at door
+  }
+  // if win condition: enemies length 0 and level==3 -> victory
+  if (level === 3 && enemies.length === 0) {
+    victory();
+    saveGame();
+  }
+};
+
+// Start main loop
+loop();
+
+</script>
+</body>
+  </html>
